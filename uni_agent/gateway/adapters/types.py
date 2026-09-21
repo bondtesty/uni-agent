@@ -44,6 +44,7 @@ class OpenAIChatMessage(TypedDict, total=False):
     tool_calls: list[OpenAIChatCompletionToolCall]
     tool_call_id: str
     reasoning_content: str | None
+    tools: list[dict[str, Any]]
 
 
 class OpenAIChatCompletionTool(TypedDict, total=False):

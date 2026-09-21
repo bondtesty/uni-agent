@@ -327,13 +327,14 @@ def test_incremental_encode_rejects_assistant_after_first_message():
         )
     )
 
+    messages = [
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "response"},
+    ]
+
+    assert not codec.supports_incremental(messages)
     with pytest.raises(ValueError, match="may only appear first"):
-        codec.encode_incremental(
-            [
-                {"role": "user", "content": "question"},
-                {"role": "assistant", "content": "response"},
-            ]
-        )
+        codec.encode_incremental(messages)
 
 
 def test_incremental_assistant_user_encode_matches_full_after_generation_prompt_rollback():

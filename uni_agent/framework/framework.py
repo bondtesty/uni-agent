@@ -5,9 +5,11 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import random
-from dataclasses import dataclass, replace
+import time
+from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
 from typing import Protocol
@@ -55,6 +57,8 @@ class _RunnerConfig:
     max_concurrent_sessions: int
     trajectory_selection: str = "all"
     session_timeout_seconds: float | None = None
+    agent_request_idle_timeout_seconds: float | None = None
+    trajectory_timeout_by_dataset: dict[str, float | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.runner_fqn:
@@ -67,6 +71,11 @@ class _RunnerConfig:
             raise ValueError(f"Unknown trajectory selection: {self.trajectory_selection}. Expected 'all' or 'longest'")
         if self.session_timeout_seconds is not None and self.session_timeout_seconds <= 0:
             raise ValueError(f"session_timeout_seconds must be positive, got {self.session_timeout_seconds}")
+        if self.agent_request_idle_timeout_seconds is not None and self.agent_request_idle_timeout_seconds <= 0:
+            raise ValueError(
+                "agent_request_idle_timeout_seconds must be positive, "
+                f"got {self.agent_request_idle_timeout_seconds}"
+            )
 
     @classmethod
     def from_config(cls, runner_name: object, runner_cfg) -> _RunnerConfig:
@@ -87,6 +96,13 @@ class _RunnerConfig:
         trajectory_selection = str(runner_cfg.get("trajectory_selection", "all"))
         raw_timeout = runner_cfg.get("session_timeout_seconds")
         session_timeout_seconds = None if raw_timeout is None else float(raw_timeout)
+        raw_idle_timeout = runner_cfg.get("agent_request_idle_timeout_seconds")
+        agent_request_idle_timeout_seconds = None if raw_idle_timeout is None else float(raw_idle_timeout)
+        raw_dataset_timeouts = runner_cfg.get("trajectory_timeout_by_dataset") or {}
+        trajectory_timeout_by_dataset = {
+            str(dataset_type): (float(timeout) if float(timeout) > 0 else None)
+            for dataset_type, timeout in dict(raw_dataset_timeouts).items()
+        }
         try:
             return cls(
                 runner_fqn="" if runner_fqn is None else str(runner_fqn),
@@ -95,6 +111,8 @@ class _RunnerConfig:
                 max_concurrent_sessions=max_concurrent_sessions,
                 trajectory_selection=trajectory_selection,
                 session_timeout_seconds=session_timeout_seconds,
+                agent_request_idle_timeout_seconds=agent_request_idle_timeout_seconds,
+                trajectory_timeout_by_dataset=trajectory_timeout_by_dataset,
             )
         except ValueError as exc:
             raise ValueError(f"agent_runners.{runner_name}: {exc}") from exc
@@ -109,13 +127,53 @@ def _materialize_runner(runner_fqn: str, runner_kwargs: dict[str, object]):
     return runner
 
 
+def _session_timeout_for_sample(
+    runner_config: _RunnerConfig,
+    sample_fields: dict[str, object],
+) -> float | None:
+    """Select the runner wall timeout, allowing mixed validation datasets."""
+    if not runner_config.trajectory_timeout_by_dataset:
+        return runner_config.session_timeout_seconds
+
+    extra_info = sample_fields.get("extra_info")
+    dataset_type = extra_info.get("dataset_type") if isinstance(extra_info, dict) else None
+    if dataset_type is None:
+        tools_kwargs = sample_fields.get("tools_kwargs")
+        if isinstance(tools_kwargs, dict):
+            dataset_type = tools_kwargs.get("dataset_type")
+    return runner_config.trajectory_timeout_by_dataset.get(
+        str(dataset_type), runner_config.session_timeout_seconds
+    )
+
+
 def _log_scope(log_context: LogContext | None):
     if log_context is None:
         return contextlib.nullcontext()
     return sample_logging.from_context(log_context)
 
 
-@ray.remote
+def _runner_task_num_cpus() -> float:
+    """Return the Ray scheduling token reserved for one agent runner task."""
+    raw_value = os.environ.get("UNI_AGENT_RUNNER_TASK_NUM_CPUS", "1")
+    try:
+        num_cpus = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            "UNI_AGENT_RUNNER_TASK_NUM_CPUS must be a positive number, "
+            f"got {raw_value!r}"
+        ) from exc
+    if not math.isfinite(num_cpus) or num_cpus <= 0:
+        raise ValueError(
+            "UNI_AGENT_RUNNER_TASK_NUM_CPUS must be a positive number, "
+            f"got {raw_value!r}"
+        )
+    return num_cpus
+
+
+_RUNNER_TASK_NUM_CPUS = _runner_task_num_cpus()
+
+
+@ray.remote(num_cpus=_RUNNER_TASK_NUM_CPUS)
 def _run_agent_runner_ray_task(
     *,
     runner_fqn: str,
@@ -144,6 +202,52 @@ def _short_failure_reason(error: BaseException) -> str:
     if not message:
         message = error.__class__.__name__
     return f"{error.__class__.__name__}:{message}"[:512]
+
+
+class AgentRequestTimeout(asyncio.TimeoutError):
+    """The external agent stopped sending requests after a model tool call."""
+
+    def __init__(self, *, idle_seconds: float, pending_tool_call_ids: list[str]):
+        self.idle_seconds = idle_seconds
+        self.pending_tool_call_ids = list(pending_tool_call_ids)
+        super().__init__(
+            f"agent sent no follow-up request for {idle_seconds:.1f}s after tool calls "
+            f"{self.pending_tool_call_ids}"
+        )
+
+
+def _framework_failure_metadata(error: BaseException) -> dict[str, object]:
+    """Describe a hard framework failure without changing its grading policy."""
+    extra: dict[str, object] = {}
+    if isinstance(error, AgentRequestTimeout):
+        status = "timeout"
+        termination_kind = "agent_request_timeout"
+        extra = {
+            "agent_status": "agent_timeout",
+            "idle_seconds": error.idle_seconds,
+            "pending_tool_call_ids": error.pending_tool_call_ids,
+        }
+    elif isinstance(error, asyncio.TimeoutError):
+        status = "timeout"
+        termination_kind = "framework_timeout"
+    elif isinstance(error, asyncio.CancelledError):
+        status = "cancelled"
+        termination_kind = "framework_cancelled"
+    else:
+        status = "failed"
+        termination_kind = "framework_error"
+    return {
+        "status": status,
+        "termination_kind": termination_kind,
+        "agent_status": "runner_error",
+        "agent_completed": False,
+        "finished": False,
+        "gradable": False,
+        "error_type": error.__class__.__name__,
+        "error_message": str(error)[:2000],
+        "result": _short_failure_reason(error),
+        **extra,
+    }
 
 
 def _select_session_trajectories(
@@ -187,6 +291,9 @@ _TQ_NESTED_SEQUENCE_FIELDS = {
     "rollout_log_probs",
     "routed_experts",
     "rm_scores",
+    "tool_call_error_mask",
+    "repetition_mask",
+    "turn_index",
     "teacher_logprobs",
     "teacher_ids",
 }
@@ -216,6 +323,220 @@ def _align_routed_experts(source: object, seq_len: int) -> torch.Tensor | None:
     if covered > 0:
         out[:covered] = experts[:covered]
     return out
+
+
+
+_REPETITION_HASH_BASE = np.uint64(1099511628211)  # FNV-1a 64-bit prime, odd so invertible mod 2**64
+_REPETITION_HASH_BASE_INV = np.uint64(pow(int(_REPETITION_HASH_BASE), -1, 1 << 64))
+_REPETITION_DETECT_DEFAULTS: dict[str, object] = {
+    "enable": False,
+    "ngram_size": 300,
+    "window_size": 8300,
+    "min_content_length": 16384,
+    "min_repeat": 15,
+    "zero_reward": False,
+}
+
+
+def _normalize_repetition_detect_config(raw: object) -> dict[str, object]:
+    """Validate ``agent_framework.repetition_detect`` and fill the reference defaults."""
+    if raw is None:
+        raw = {}
+    if OmegaConf.is_config(raw):
+        raw = OmegaConf.to_container(raw, resolve=True)
+    if not isinstance(raw, dict):
+        raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.repetition_detect must be a mapping")
+    unknown = set(raw) - set(_REPETITION_DETECT_DEFAULTS)
+    if unknown:
+        raise ValueError(f"repetition_detect has unknown keys: {sorted(unknown)}")
+    cfg = dict(_REPETITION_DETECT_DEFAULTS)
+    cfg.update(raw)
+    for key in ("enable", "zero_reward"):
+        if type(cfg[key]) is not bool:
+            raise ValueError(f"repetition_detect.{key} must be a bool")
+    for key in ("ngram_size", "window_size", "min_repeat"):
+        value = cfg[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"repetition_detect.{key} must be a positive int")
+    gate = cfg["min_content_length"]
+    if isinstance(gate, bool) or not isinstance(gate, int) or gate < 0:
+        raise ValueError("repetition_detect.min_content_length must be a non-negative int")
+    if cfg["window_size"] < cfg["ngram_size"]:
+        raise ValueError("repetition_detect.window_size must be >= ngram_size")
+    return cfg
+
+
+def _rolling_ngram_hashes(token_ids: np.ndarray, ngram_size: int) -> np.ndarray:
+    """64-bit polynomial hash of every ``ngram_size``-token window, wrapping mod 2**64.
+
+    H[i] = sum_{j<n} (t[i+j]+1) * B**(n-1-j). Computed as
+    B**(i+n-1) * (S[i+n] - S[i]) with S the prefix sum of (t[j]+1) * B**(-j); B is odd so
+    its inverse modulo 2**64 exists and every product wraps consistently in uint64.
+    """
+    n = int(ngram_size)
+    tokens = np.asarray(token_ids, dtype=np.uint64) + np.uint64(1)
+    count = tokens.shape[0] - n + 1
+    if count <= 0:
+        return np.empty(0, dtype=np.uint64)
+    with np.errstate(over="ignore"):
+        inv_powers = np.cumprod(np.full(tokens.shape[0], _REPETITION_HASH_BASE_INV, dtype=np.uint64))
+        inv_powers = np.concatenate([np.ones(1, dtype=np.uint64), inv_powers[:-1]])  # B**(-j)
+        prefix = np.concatenate([np.zeros(1, dtype=np.uint64), np.cumsum(tokens * inv_powers, dtype=np.uint64)])
+        powers = np.cumprod(np.full(tokens.shape[0], _REPETITION_HASH_BASE, dtype=np.uint64))  # B**(i+1)
+        scale = powers[n - 2 : n - 2 + count] if n >= 2 else np.ones(count, dtype=np.uint64)
+        return (prefix[n : n + count] - prefix[:count]) * scale
+
+
+def repetition_first_hit(
+    token_ids,
+    *,
+    ngram_size: int = 300,
+    window_size: int = 8300,
+    min_content_length: int = 16384,
+    min_repeat: int = 15,
+) -> int:
+    """Token offset (exclusive end of the repeated n-gram) of the first repetition hit, or -1.
+
+    Same predicate as the reference ``_check_repetition_tokens``: at position ``i`` the window
+    holds the n-grams starting in ``[i + ngram_size - window_size, i]``; a hit is the first
+    ``i`` whose n-gram occurs at least ``min_repeat`` times in that window.
+    """
+    seq_len = len(token_ids)
+    if seq_len < min_content_length or seq_len < ngram_size:
+        return -1
+    if min_repeat <= 1:
+        return ngram_size
+    hashes = _rolling_ngram_hashes(token_ids, ngram_size)
+    order = np.argsort(hashes, kind="stable")  # groups equal hashes, positions ascending within a group
+    sorted_hashes = hashes[order]
+    positions = order.astype(np.int64)
+    lag = min_repeat - 1
+    if positions.shape[0] <= lag:
+        return -1
+    same = sorted_hashes[lag:] == sorted_hashes[:-lag]
+    within = (positions[lag:] - positions[:-lag]) <= (window_size - ngram_size)
+    candidates = positions[lag:][same & within]
+    if candidates.size == 0:
+        return -1
+    return int(candidates.min()) + ngram_size
+
+
+def _repetition_hit_segments(trajectory: Trajectory, cfg: dict[str, object]) -> list[int]:
+    """Indices of generation spans whose tokens trip ``repetition_first_hit``."""
+    hits: list[int] = []
+    response_ids = np.asarray(trajectory.response_ids, dtype=np.int64)
+    for index, span in enumerate(trajectory.generation_spans):
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            continue
+        start, end = int(span[0]), int(span[1])
+        if start < 0 or end <= start or end > response_ids.shape[0]:
+            continue
+        offset = repetition_first_hit(
+            response_ids[start:end],
+            ngram_size=int(cfg["ngram_size"]),
+            window_size=int(cfg["window_size"]),
+            min_content_length=int(cfg["min_content_length"]),
+            min_repeat=int(cfg["min_repeat"]),
+        )
+        if offset >= 0:
+            hits.append(index)
+    return hits
+
+
+def _repetition_mask(trajectory: Trajectory) -> tuple[torch.Tensor, str, int]:
+    """Expand ``reward_info.repetition_hit_segments`` onto response-token offsets.
+
+    Mirrors ``_tool_call_error_mask``: the framework decided the hits at scoring time
+    (``_annotate_repetition``); here they are only projected through ``generation_spans``.
+    Fail closed on any inconsistency so a bad span cannot mask unrelated tokens.
+    """
+    mask = torch.zeros(len(trajectory.response_ids), dtype=torch.float32)
+    reward_info = trajectory.reward_info if isinstance(trajectory.reward_info, dict) else {}
+    hits = reward_info.get("repetition_hit_segments")
+    if hits is None:
+        return mask, "not_detected", 0
+    if not isinstance(hits, (list, tuple)):
+        return mask, "invalid_hits", 0
+    spans = trajectory.generation_spans
+    marked = 0
+    for index in hits:
+        if not isinstance(index, int) or isinstance(index, bool) or index < 0 or index >= len(spans):
+            return torch.zeros_like(mask), "invalid_hit_index", 0
+        span = spans[index]
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            return torch.zeros_like(mask), "invalid_span", 0
+        try:
+            start, end = int(span[0]), int(span[1])
+        except (TypeError, ValueError, OverflowError):
+            return torch.zeros_like(mask), "invalid_span", 0
+        if start < 0 or end < start or end > len(mask):
+            return torch.zeros_like(mask), "invalid_span", 0
+        mask[start:end] = 1.0
+        marked += 1
+    return mask, "ok", marked
+
+
+def _turn_index(trajectory: Trajectory) -> tuple[torch.Tensor, str]:
+    """Per-response-token generation-turn index projected through ``generation_spans``.
+
+    Tokens inside span ``i`` get value ``i``; tokens outside every span (observations,
+    tool results) get ``-1``. Consumed by the trainer's experimental
+    ``algorithm.deep_failure_mask`` channel. Fails closed (all ``-1``) on any span
+    inconsistency so a bad span can never mark unrelated tokens.
+    """
+    n = len(trajectory.response_ids)
+    index = torch.full((n,), -1, dtype=torch.long)
+    spans = trajectory.generation_spans
+    if not isinstance(spans, (list, tuple)):
+        return index, "invalid_spans"
+    prev_end = 0
+    for i, span in enumerate(spans):
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            return torch.full((n,), -1, dtype=torch.long), "invalid_span"
+        try:
+            start, end = int(span[0]), int(span[1])
+        except (TypeError, ValueError, OverflowError):
+            return torch.full((n,), -1, dtype=torch.long), "invalid_span"
+        if start < prev_end or end < start or end > n:
+            return torch.full((n,), -1, dtype=torch.long), "invalid_span"
+        index[start:end] = i
+        prev_end = end
+    return index, "ok"
+
+
+def _tool_call_error_mask(trajectory: Trajectory) -> tuple[torch.Tensor, str, int]:
+    """Expand per-generation tool errors onto response-token offsets.
+
+    The runner owns error classification while the gateway owns token spans.
+    Refuse to guess when their lengths disagree: a zero mask plus an explicit
+    alignment status is safer than penalizing the wrong assistant turn.
+    """
+    mask = torch.zeros(len(trajectory.response_ids), dtype=torch.float32)
+    reward_info = trajectory.reward_info if isinstance(trajectory.reward_info, dict) else {}
+    flags = reward_info.get("tool_call_error_flags")
+    spans = trajectory.generation_spans
+    if flags is None:
+        return mask, "missing_flags", 0
+    if not isinstance(flags, (list, tuple)):
+        return mask, "invalid_flags", 0
+    if len(flags) != len(spans):
+        return mask, "length_mismatch", 0
+
+    marked = 0
+    for flag, span in zip(flags, spans):
+        if not flag:
+            continue
+        if not isinstance(span, (list, tuple)) or len(span) != 2:
+            return torch.zeros_like(mask), "invalid_span", 0
+        try:
+            start, end = int(span[0]), int(span[1])
+        except (TypeError, ValueError, OverflowError):
+            return torch.zeros_like(mask), "invalid_span", 0
+        if start < 0 or end < start or end > len(mask):
+            return torch.zeros_like(mask), "invalid_span", 0
+        mask[start:end] = 1.0
+        marked += 1
+    return mask, "ok", marked
 
 
 def _list_of_tq_fields_to_tensordict(fields: list[dict[str, object]]) -> TensorDict:
@@ -303,6 +624,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     #: ray.cancel (letting its sandbox context manager tear down) before the
     #: framework escalates to a force-kill.
     _RUNNER_CANCEL_GRACE_SECONDS = 30.0
+    _RUNNER_ACTIVITY_POLL_SECONDS = 5.0
 
     def __init__(
         self,
@@ -310,10 +632,13 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         *,
         runner_registry: dict[str, _RunnerConfig],
         reward_loop_worker_handles=None,
+        tokenizer=None,
         processor=None,
         rollout_config=None,
         log_dir: str | None = None,
         mask_unfinished_episode: bool = False,
+        repetition_detect: dict[str, object] | None = None,
+        ship_turn_index: bool = False,
     ):
         self.gateway_manager = gateway_manager
         self.runner_registry = runner_registry
@@ -325,12 +650,15 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             if runner_config.dispatch_mode == "inline_async"
         }
         self.reward_loop_worker_handles = list(reward_loop_worker_handles) if reward_loop_worker_handles else None
+        self._tokenizer = tokenizer
         self._processor = processor
         self._rollout_config = rollout_config
         self._runner_semaphores: dict[str, asyncio.Semaphore] = {}
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._log_dir = log_dir
         self._mask_unfinished_episode = mask_unfinished_episode
+        self._repetition_detect = _normalize_repetition_detect_config(repetition_detect)
+        self._ship_turn_index = ship_turn_index
 
     @classmethod
     def from_config(
@@ -338,6 +666,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         *,
         config,
         gateway_manager,
+        tokenizer=None,
         processor=None,
         reward_loop_worker_handles=None,
     ) -> OpenAICompatibleAgentFramework:
@@ -355,7 +684,8 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             configured_log_dir = af_cfg.get("log_dir")
             log_dir = str(configured_log_dir) if configured_log_dir else None
         else:
-            log_dir = os.environ.get("UNI_AGENT_LOG_DIR") or "/tmp/uni_agent_logs"
+            output_root = os.environ.get("VERL_HOME") or os.getcwd()
+            log_dir = os.environ.get("UNI_AGENT_LOG_DIR") or str(Path(output_root) / "outputs" / "uni_agent_logs")
 
         if not bool(af_cfg.get("use_reward_loop_worker", True)):
             reward_loop_worker_handles = None
@@ -364,14 +694,23 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         if type(mask_unfinished_episode) is not bool:
             raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.mask_unfinished_episode must be a bool")
 
+        repetition_detect = _normalize_repetition_detect_config(af_cfg.get("repetition_detect"))
+
+        ship_turn_index = af_cfg.get("ship_turn_index", False)
+        if type(ship_turn_index) is not bool:
+            raise ValueError("actor_rollout_ref.rollout.custom.agent_framework.ship_turn_index must be a bool")
+
         return cls(
             gateway_manager=gateway_manager,
             runner_registry=runner_registry,
             reward_loop_worker_handles=reward_loop_worker_handles,
+            tokenizer=tokenizer,
             processor=processor,
             rollout_config=config.actor_rollout_ref.rollout,
             log_dir=log_dir,
             mask_unfinished_episode=mask_unfinished_episode,
+            repetition_detect=repetition_detect,
+            ship_turn_index=ship_turn_index,
         )
 
     def _build_session_sampling_params(
@@ -389,6 +728,15 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             "repetition_penalty": 1.0,
             "logprobs": config.calculate_log_probs,
         }
+        tokenizer_eos = getattr(self._tokenizer, "eos_token_id", None)
+        if isinstance(tokenizer_eos, (list, tuple, set)):
+            stop_token_ids = sorted({int(token_id) for token_id in tokenizer_eos})
+        elif tokenizer_eos is not None:
+            stop_token_ids = [int(tokenizer_eos)]
+        else:
+            stop_token_ids = []
+        if stop_token_ids:
+            sampling_params["stop_token_ids"] = stop_token_ids
         if partition_id == "val":
             sampling_params.update(
                 temperature=config.val_kwargs.temperature,
@@ -677,20 +1025,27 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         raw_prompt = sample_fields["raw_prompt"]
         tools_kwargs = sample_fields.get("tools_kwargs")
+        if isinstance(tools_kwargs, dict):
+            tools_kwargs = dict(tools_kwargs)
+            tools_kwargs["rollout_index"] = session_index
+            if global_steps is not None:
+                tools_kwargs["harness_round"] = int(global_steps)
         async with _log_scope(parent_log):
-            session = await self.gateway_manager.create_session(
-                session_id,
-                sampling_params=dict(sampling_params),
-            )
-            logger.info(
-                "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s",
-                session_id,
-                runner_name,
-                sample_index,
-                session_index,
-                global_steps,
-            )
+            session = None
             try:
+                session = await self.gateway_manager.create_session(
+                    session_id,
+                    sampling_params=dict(sampling_params),
+                )
+                logger.info(
+                    "session %s start: runner=%s sample_index=%s session_index=%s global_steps=%s stop_token_ids=%s",
+                    session_id,
+                    runner_name,
+                    sample_index,
+                    session_index,
+                    global_steps,
+                    sampling_params.get("stop_token_ids", []),
+                )
                 if runner_config.dispatch_mode == "ray_task":
                     # Ray workers run only the runner. Gateway token truth,
                     # finalization, reward scoring, and TQ writes stay in parent.
@@ -713,9 +1068,12 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                     # unwinds and its sandbox context manager tears down cleanly;
                     # force-kill only if it ignores the cancel.
                     try:
-                        await asyncio.wait_for(
+                        session_timeout = _session_timeout_for_sample(runner_config, sample_fields)
+                        await self._wait_for_runner_task(
                             object_ref,
-                            timeout=runner_config.session_timeout_seconds,
+                            session_id=session_id,
+                            session_timeout_seconds=session_timeout,
+                            request_idle_timeout_seconds=runner_config.agent_request_idle_timeout_seconds,
                         )
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         await self._cancel_runner_task(object_ref, session_id)
@@ -728,18 +1086,60 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                         sample_index=sample_index,
                         **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
                     )
-                session_trajectories = await self.gateway_manager.finalize_session(session_id)
+                all_session_trajectories = await self.gateway_manager.finalize_session(session_id)
                 session_trajectories = _select_session_trajectories(
                     session_id,
-                    session_trajectories,
+                    all_session_trajectories,
                     runner_config.trajectory_selection,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("session %s failed (runner=%s); aborting session", session_id, runner_name)
-                await self.gateway_manager.abort_session(session_id)
+                partial_trajectories = []
+                if session is not None:
+                    try:
+                        partial_trajectories = await self.gateway_manager.abort_session(session_id)
+                    except Exception:
+                        logger.exception("session %s: abort snapshot failed", session_id)
+                failure_info = _framework_failure_metadata(exc)
+                failed = [replace(traj, reward_info=dict(failure_info)) for traj in partial_trajectories]
+                if run_dir is not None:
+                    if failed:
+                        await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, failed)
+                    await asyncio.to_thread(
+                        self._dump_session_manifest,
+                        run_dir,
+                        session_id,
+                        sample_fields,
+                        sample_index,
+                        session_index,
+                        runner_name,
+                        failed,
+                        failure_info,
+                    )
                 raise
 
             if not session_trajectories:
+                if run_dir is not None:
+                    await asyncio.to_thread(
+                        self._dump_session_manifest,
+                        run_dir,
+                        session_id,
+                        sample_fields,
+                        sample_index,
+                        session_index,
+                        runner_name,
+                        [],
+                        {
+                            "status": "failed",
+                            "termination_kind": "no_trajectory",
+                            "agent_status": "runner_empty",
+                            "agent_completed": False,
+                            "finished": False,
+                            "gradable": False,
+                            "error_type": "EmptyTrajectory",
+                            "error_message": "session finalized without a materialized trajectory",
+                        },
+                    )
                 return session_trajectories, sample_fields
 
             # Prefer the reward the runner posted to the session (report_reward=True);
@@ -763,11 +1163,92 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                     )
                     for traj, (score, extra) in zip(session_trajectories, annotations, strict=True)
                 ]
+            result_trajectories = self._annotate_repetition(session_id, result_trajectories)
 
             self._log_trajectory_summary(session_id, result_trajectories)
             if run_dir is not None:
                 await asyncio.to_thread(self._dump_trajectories, run_dir, session_id, result_trajectories)
+                if len(all_session_trajectories) != len(result_trajectories):
+                    await asyncio.to_thread(
+                        self._dump_semantic_trajectory,
+                        run_dir,
+                        session_id,
+                        all_session_trajectories,
+                    )
+                await asyncio.to_thread(
+                    self._dump_session_manifest,
+                    run_dir,
+                    session_id,
+                    sample_fields,
+                    sample_index,
+                    session_index,
+                    runner_name,
+                    result_trajectories,
+                    None,
+                )
             return result_trajectories, sample_fields
+
+    async def _wait_for_runner_task(
+        self,
+        object_ref,
+        *,
+        session_id: str,
+        session_timeout_seconds: float | None,
+        request_idle_timeout_seconds: float | None,
+    ) -> None:
+        """Wait for a Ray runner with separate wall and external-request idle budgets."""
+        if session_timeout_seconds is None and request_idle_timeout_seconds is None:
+            await object_ref
+            return
+
+        runner_wait_task = asyncio.ensure_future(asyncio.shield(object_ref))
+        started_at = time.monotonic()
+        try:
+            while not runner_wait_task.done():
+                remaining_wall = (
+                    session_timeout_seconds - (time.monotonic() - started_at)
+                    if session_timeout_seconds is not None
+                    else None
+                )
+                if remaining_wall is not None and remaining_wall <= 0:
+                    raise asyncio.TimeoutError(
+                        f"session exceeded wall timeout of {session_timeout_seconds:.1f}s"
+                    )
+
+                wait_seconds = self._RUNNER_ACTIVITY_POLL_SECONDS
+                if remaining_wall is not None:
+                    wait_seconds = min(wait_seconds, remaining_wall)
+                if request_idle_timeout_seconds is not None:
+                    wait_seconds = min(wait_seconds, request_idle_timeout_seconds)
+                done, _ = await asyncio.wait({runner_wait_task}, timeout=wait_seconds)
+                if done:
+                    break
+
+                if request_idle_timeout_seconds is None:
+                    continue
+                try:
+                    state = await self.gateway_manager.get_session_state(session_id)
+                except Exception:
+                    logger.warning("session %s: failed to inspect request-idle state", session_id, exc_info=True)
+                    continue
+                if runner_wait_task.done() or int(state.get("in_flight_requests", 0)) > 0:
+                    continue
+                if state.get("agent_finished"):
+                    continue
+                idle_seconds = state.get("awaiting_external_followup_seconds")
+                if not state.get("awaiting_external_followup") or idle_seconds is None:
+                    continue
+                idle_seconds = float(idle_seconds)
+                if idle_seconds >= request_idle_timeout_seconds:
+                    raise AgentRequestTimeout(
+                        idle_seconds=idle_seconds,
+                        pending_tool_call_ids=[str(value) for value in state.get("pending_tool_call_ids", [])],
+                    )
+
+            await runner_wait_task
+        finally:
+            if not runner_wait_task.done():
+                runner_wait_task.cancel()
 
     async def _cancel_runner_task(self, object_ref, session_id: str) -> None:
         """Cancel a dispatched runner Ray task after its session timed out.
@@ -801,6 +1282,47 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             # Task terminated while being cancelled (e.g. TaskCancelledError);
             # that is the expected outcome.
             pass
+
+    def _annotate_repetition(self, session_id: str, trajectories: list[Trajectory]) -> list[Trajectory]:
+        """Stamp repetition hits on every trajectory of a session.
+
+        Runs after scoring so the verdict sits next to the reward it may override:
+        ``reward_info.repetition_hit_segments`` lists the generation spans that trip the
+        n-gram rule (projected to ``repetition_mask`` at TQ write time), and with
+        ``zero_reward`` any hit forces ``reward_score`` to 0 the way the reference implementation's
+        ``early_stop`` skips the verifier. Detection is per trajectory, but the reward
+        override is session-wide: the runner posted one reward for the whole session.
+        Disabled config leaves the trajectories untouched so old runs stay byte-identical.
+        """
+        cfg = self._repetition_detect
+        if not cfg["enable"]:
+            return trajectories
+        hits_by_index = [_repetition_hit_segments(traj, cfg) for traj in trajectories]
+        session_hit = any(hits_by_index)
+        annotated: list[Trajectory] = []
+        for traj, hits in zip(trajectories, hits_by_index, strict=True):
+            reward_info = {
+                **(traj.reward_info if isinstance(traj.reward_info, dict) else {}),
+                "repetition_hit_segments": list(hits),
+                "repetition_hit": bool(hits),
+            }
+            reward_score = traj.reward_score
+            if session_hit and cfg["zero_reward"]:
+                reward_info["repetition_original_reward"] = reward_score
+                reward_info["repetition_zeroed_reward"] = True
+                reward_score = 0.0
+            annotated.append(replace(traj, reward_info=reward_info, reward_score=reward_score))
+        if session_hit:
+            logger.warning(
+                "session %s: repetition detected in generation spans %s (ngram=%d window=%d min_repeat=%d); %s",
+                session_id,
+                hits_by_index,
+                int(cfg["ngram_size"]),
+                int(cfg["window_size"]),
+                int(cfg["min_repeat"]),
+                "reward forced to 0" if cfg["zero_reward"] else "reward kept",
+            )
+        return annotated
 
     def _log_trajectory_summary(self, session_id: str, trajectories: list[Trajectory]) -> None:
         """Log a per-session trajectory summary -- the info the task layer can't emit,
@@ -849,14 +1371,125 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 arrays[f"traj{i}_prompt_ids"] = np.asarray(traj.prompt_ids, dtype=np.int32)
                 arrays[f"traj{i}_response_ids"] = np.asarray(traj.response_ids, dtype=np.int32)
                 arrays[f"traj{i}_response_mask"] = np.asarray(traj.response_mask, dtype=np.int8)
+                arrays[f"traj{i}_generation_spans"] = np.asarray(
+                    traj.generation_spans, dtype=np.int64
+                ).reshape((len(traj.generation_spans), 2))
                 if traj.response_logprobs is not None:
                     arrays[f"traj{i}_response_logprobs"] = np.asarray(traj.response_logprobs, dtype=np.float32)
 
             buf = io.BytesIO()
             np.savez_compressed(buf, **arrays)
             (run_dir / "trajectory.npz").write_bytes(buf.getvalue())
+            self._dump_semantic_trajectory(run_dir, session_id, trajectories)
         except Exception:
             logger.exception("session %s: failed to write trajectory dump under %s", session_id, run_dir)
+
+    def _dump_semantic_trajectory(
+        self, run_dir: Path, session_id: str, trajectories: list[Trajectory]
+    ) -> None:
+        """Write a human-readable session transcript."""
+        trajs: dict[str, dict[str, object]] = {}
+        tool_counts: dict[str, int] = {}
+        for index, trajectory in enumerate(trajectories):
+            messages = getattr(trajectory, "messages", None) or []
+            model_messages = getattr(trajectory, "model_messages", None) or messages
+            tools = getattr(trajectory, "tools", None)
+            model_tools = getattr(trajectory, "model_tools", None)
+            key = "main" if index == 0 else f"chain_{index + 1}"
+            trajs[key] = {
+                "messages": messages,
+                "model_messages": model_messages,
+                "tools": tools,
+                "model_tools": model_tools,
+                "num_turns": trajectory.num_turns,
+                "reward_info": trajectory.reward_info or {},
+                "reward_score": trajectory.reward_score,
+            }
+            for message in messages:
+                for call in message.get("tool_calls", []) if isinstance(message, dict) else []:
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function") or {}
+                    name = function.get("name") if isinstance(function, dict) else None
+                    if name:
+                        tool_counts[str(name)] = tool_counts.get(str(name), 0) + 1
+
+        reward_info = dict(trajectories[-1].reward_info or {}) if trajectories else {}
+        status = reward_info.get("agent_status") or reward_info.get("claude_code_status")
+        if status is None and "finished" in reward_info:
+            status = "Completed" if reward_info["finished"] else "Unfinished"
+        payload = {
+            "trajectory_format": "mimoagent",
+            "info": {
+                "session_id": session_id,
+                "exit_status": status,
+                "result": reward_info.get("result"),
+                "reward": reward_info.get("reward"),
+                "reward_info": reward_info,
+                "tool_calls": tool_counts,
+            },
+            "trajs": trajs,
+        }
+        (run_dir / "traj.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default),
+            encoding="utf-8",
+        )
+
+    def _dump_session_manifest(
+        self,
+        run_dir: Path,
+        session_id: str,
+        sample_fields: dict[str, object],
+        sample_index: int,
+        session_index: int,
+        runner_name: str,
+        trajectories: list[Trajectory],
+        failure_info: dict[str, object] | None,
+    ) -> None:
+        """Persist one lifecycle record without feeding it back into rollout data."""
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            reward_info = dict(trajectories[-1].reward_info or {}) if trajectories else {}
+            lifecycle = dict(failure_info or {})
+            if not lifecycle:
+                termination_kind = reward_info.get("termination_kind") or "completed"
+                lifecycle = {
+                    "status": "truncated" if termination_kind == "truncated" else "completed",
+                    "termination_kind": termination_kind,
+                    "agent_status": reward_info.get("agent_status"),
+                    "agent_completed": reward_info.get("agent_completed"),
+                    "finished": reward_info.get("finished"),
+                    "gradable": True,
+                    "error_type": None,
+                    "error_message": None,
+                }
+            tools_kwargs = sample_fields.get("tools_kwargs")
+            dataset_index = tools_kwargs.get("dataset_index") if isinstance(tools_kwargs, dict) else None
+            selected_harness = reward_info.get("selected_harness") or reward_info.get("agent_type")
+            payload = {
+                "session_id": session_id,
+                "sample_index": sample_index,
+                "session_index": session_index,
+                "dataset_index": dataset_index,
+                "data_source": sample_fields.get("data_source"),
+                "runner_name": runner_name,
+                "selected_harness": selected_harness,
+                **lifecycle,
+                "num_trajectories": len(trajectories),
+                "num_turns": max((trajectory.num_turns for trajectory in trajectories), default=0),
+                "reward_score": trajectories[-1].reward_score if trajectories else None,
+                "has_trajectory": bool(trajectories),
+                "trajectory_path": str(run_dir / "traj.json") if trajectories else None,
+            }
+            target = run_dir / "session.json"
+            temporary = run_dir / "session.json.tmp"
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=_json_default),
+                encoding="utf-8",
+            )
+            temporary.replace(target)
+        except Exception:
+            logger.exception("session %s: failed to write lifecycle manifest under %s", session_id, run_dir)
 
     def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""
@@ -871,6 +1504,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             "prompt_len": len(traj.prompt_ids),
             "response_len": len(traj.response_ids),
             "model_token_count": sum(traj.response_mask) if traj.response_mask else 0,
+            "generation_spans": [list(span) for span in traj.generation_spans],
             "has_routed_experts": traj.routed_experts is not None,
             "has_logprobs": traj.response_logprobs is not None,
         }
@@ -986,6 +1620,10 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         prompts = torch.tensor(trajectory.prompt_ids, dtype=torch.long)
         responses = torch.tensor(trajectory.response_ids, dtype=torch.long)
         source_response_mask = torch.tensor(trajectory.response_mask, dtype=torch.long)
+        tool_call_error_mask, tool_call_error_alignment, tool_call_error_segments = _tool_call_error_mask(
+            trajectory
+        )
+        repetition_mask, repetition_alignment, repetition_segments = _repetition_mask(trajectory)
         finished = trajectory.reward_info.get("finished")
         if finished is not None and type(finished) is not bool:
             raise ValueError("reward_info.finished must be a bool or null")
@@ -1036,7 +1674,17 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         # Framework-owned masks must win over same-named Gateway extra fields.
         field["response_mask"] = response_mask
         field["loss_mask"] = response_mask
+        field["tool_call_error_mask"] = tool_call_error_mask
+        field["repetition_mask"] = repetition_mask
+        if self._ship_turn_index:
+            field["turn_index"], _turn_index_status = _turn_index(trajectory)
         field.pop("multi_modal_data", None)
+        selected_harness = None
+        if isinstance(trajectory.reward_info, dict):
+            selected_harness = (
+                trajectory.reward_info.get("selected_harness")
+                or trajectory.reward_info.get("agent_type")
+            )
         for key in (
             "uid",
             "raw_prompt",
@@ -1048,6 +1696,14 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         ):
             if key in sample_fields:
                 field[key] = sample_fields[key]
+        tag_data_source = bool(
+            isinstance(trajectory.reward_info, dict)
+            and trajectory.reward_info.get("tag_data_source_with_harness")
+        )
+        if selected_harness and tag_data_source:
+            source = str(field.get("data_source") or "")
+            if "@" not in source:
+                field["data_source"] = f"{source}@{selected_harness}"
         field["session_id"] = session_index
         field["global_steps"] = global_steps
         field["num_turns"] = torch.tensor(int(trajectory.num_turns), dtype=torch.long)
@@ -1073,4 +1729,24 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         materialization_reason = trajectory.extra_fields.get("materialization_reason")
         if materialization_reason is not None:
             tag["materialization_reason"] = materialization_reason
+        reward_info = trajectory.reward_info if isinstance(trajectory.reward_info, dict) else {}
+        agent_type = reward_info.get("agent_type") or reward_info.get("selected_harness")
+        tag["agent_type"] = str(agent_type) if agent_type else "unknown"
+        tag["tool_call_error_count"] = int(reward_info.get("tool_call_error_count") or 0)
+        for error_type in (
+            "unknown_tool",
+            "invalid_arguments",
+            "incompatible_payload",
+            "other_tool_error",
+        ):
+            tag[f"tool_call_error_{error_type}_count"] = int(
+                reward_info.get(f"tool_call_error_{error_type}_count") or 0
+            )
+        tag["codex_transport_error_count"] = int(reward_info.get("codex_transport_error_count") or 0)
+        tag["tool_call_error_alignment"] = tool_call_error_alignment
+        tag["tool_call_error_segment_count"] = tool_call_error_segments
+        tag["repetition_alignment"] = repetition_alignment
+        tag["repetition_segment_count"] = repetition_segments
+        tag["repetition_hit"] = int(bool(reward_info.get("repetition_hit")))
+        tag["repetition_zeroed_reward"] = int(bool(reward_info.get("repetition_zeroed_reward")))
         return field, tag

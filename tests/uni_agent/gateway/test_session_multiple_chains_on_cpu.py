@@ -1,4 +1,5 @@
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,7 @@ from tests.uni_agent.support import (
     fake_vision_info_extractor,
 )
 from uni_agent.gateway.adapters.openai import openai_to_internal
+from uni_agent.gateway.adapters.responses import responses_to_internal
 from uni_agent.gateway.session import GatewaySession, MessageCodec, SessionHandle
 from verl.workers.rollout.replica import TokenOutput
 
@@ -219,6 +221,116 @@ async def test_multiple_chains_linear_conversation_stays_single_chain():
 
 
 @pytest.mark.asyncio
+async def test_responses_exec_input_history_keeps_tool_tokens_trainable(monkeypatch):
+    """The adapter's JavaScript wire wrapper must round-trip to one session chain."""
+    import uni_agent.gateway.session.codec as codec_mod
+
+    javascript = 'const r = await tools.exec_command({"cmd": "pwd"});\ntext(r.output);'
+
+    async def fake_extract(response_ids, tools, parser_name, tokenizer):
+        text = tokenizer.decode(response_ids, skip_special_tokens=False)
+        if text == "EXEC_CMD":
+            return "", [SimpleNamespace(name="exec", arguments=json.dumps({"input": javascript}))]
+        return text, []
+
+    monkeypatch.setattr(codec_mod, "_extract_tool_calls", fake_extract)
+    session = _session("responses-structured-exec", tool_parser_name="qwen3_xml")
+    backend = SequencedBackend(["EXEC_CMD", "FINAL"])
+    tools = [{"type": "custom", "name": "exec", "description": "Run JavaScript tool calls"}]
+
+    first = responses_to_internal(
+        {
+            "model": "policy",
+            "input": [{"type": "message", "role": "user", "content": "inspect"}],
+            "tools": tools,
+        },
+        base_sampling_params={},
+        allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+    )
+    first_outcome = await session.run_generation(first, backend)
+    first_call = first_outcome.assistant_msg["tool_calls"][0]
+    assert json.loads(first_call["function"]["arguments"]) == {"input": javascript}
+
+    second = responses_to_internal(
+        {
+            "model": "policy",
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect"},
+                {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "input": javascript},
+                {"type": "custom_tool_call_output", "call_id": "call-1", "output": "/app"},
+            ],
+            "tools": tools,
+        },
+        base_sampling_params={},
+        allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+    )
+    await session.run_generation(second, backend)
+    trajectories = await session.finalize()
+
+    assert len(trajectories) == 1
+    assert _decode_response_ids(trajectories[0].response_ids).startswith("EXEC_CMD")
+    assert trajectories[0].response_mask[: len("EXEC_CMD")] == [1] * len("EXEC_CMD")
+    assert trajectories[0].response_mask[-len("FINAL") :] == [1] * len("FINAL")
+
+
+@pytest.mark.asyncio
+async def test_responses_direct_exec_body_history_keeps_tool_tokens_trainable_without_rollback(monkeypatch):
+    """A direct generated body and Responses input wrapper share one chain."""
+    import uni_agent.gateway.session.codec as codec_mod
+
+    javascript = 'const r = await tools.exec_command({"cmd": "pwd"});\ntext(r.output);'
+
+    async def fake_extract(response_ids, tools, parser_name, tokenizer):
+        text = tokenizer.decode(response_ids, skip_special_tokens=False)
+        if text == "EXEC_CMD":
+            return "", [SimpleNamespace(name="exec", arguments=javascript)]
+        return text, []
+
+    monkeypatch.setattr(codec_mod, "_extract_tool_calls", fake_extract)
+    session = _session(
+        "responses-direct-exec",
+        tool_parser_name="qwen3_xml",
+        enable_last_assistant_rollback=True,
+    )
+    backend = SequencedBackend(["EXEC_CMD", "FINAL"])
+    tools = [{"type": "custom", "name": "exec", "description": "Run JavaScript tool calls"}]
+
+    first = responses_to_internal(
+        {
+            "model": "policy",
+            "input": [{"type": "message", "role": "user", "content": "inspect"}],
+            "tools": tools,
+        },
+        base_sampling_params={},
+        allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+    )
+    first_outcome = await session.run_generation(first, backend)
+    assert first_outcome.assistant_msg["tool_calls"][0]["function"]["arguments"] == javascript
+
+    second = responses_to_internal(
+        {
+            "model": "policy",
+            "input": [
+                {"type": "message", "role": "user", "content": "inspect"},
+                {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "input": javascript},
+                {"type": "custom_tool_call_output", "call_id": "call-1", "output": "/app"},
+            ],
+            "tools": tools,
+        },
+        base_sampling_params={},
+        allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+    )
+    await session.run_generation(second, backend)
+    trajectories = await session.finalize()
+
+    assert session.snapshot_state()["rollback_count"] == 0
+    assert len(trajectories) == 1
+    assert trajectories[0].response_ids[: len("EXEC_CMD")] == _ids("EXEC_CMD")
+    assert trajectories[0].response_mask[: len("EXEC_CMD")] == [1] * len("EXEC_CMD")
+    assert trajectories[0].response_mask[-len("FINAL") :] == [1] * len("FINAL")
+
+
+@pytest.mark.asyncio
 async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
     """Split subagent history into a sibling and later resume the main chain."""
     session = _session("subagent-return")
@@ -306,6 +418,10 @@ async def test_first_assistant_rewrite_reuses_chain_without_stale_response():
     assert chain.buffer.response_ids == incremental_ids + _ids("FIXED")
     assert chain.buffer.response_mask == [0] * len(incremental_ids) + [1] * len("FIXED")
     assert chain.buffer.response_logprobs == [0.0] * len(incremental_ids) + [-0.1] * len("FIXED")
+    assert chain.buffer.generation_spans == [
+        (0, 0),
+        (len(incremental_ids), len(incremental_ids) + len("FIXED")),
+    ]
 
 
 @pytest.mark.asyncio
@@ -327,6 +443,33 @@ async def test_first_assistant_rollback_failure_preserves_original_chain():
     assert state["active_chain_ids"] == [1]
     assert state["rollback_count"] == 0
     assert _decode_response_ids(session.active_chains[0].buffer.response_ids) == "FORMAT_ERROR"
+
+
+@pytest.mark.parametrize("foreign_first_assistant", ["LOCAL", "FOREIGN"])
+@pytest.mark.asyncio
+async def test_multi_assistant_suffix_starts_sibling_chain(foreign_first_assistant):
+    """Do not splice a progressed client branch into one stored chain."""
+    session = _session("progressed-branch", enable_last_assistant_rollback=True)
+    first_messages = [{"role": "user", "content": "run task"}]
+    foreign_history = [
+        *first_messages,
+        {"role": "assistant", "content": foreign_first_assistant},
+        {"role": "user", "content": "first tool result"},
+        {"role": "assistant", "content": "FOREIGN-LATER"},
+        {"role": "user", "content": "second tool result"},
+    ]
+    backend = SequencedBackend(["LOCAL", "CURRENT"])
+
+    await _run(session, backend, first_messages)
+    await _run(session, backend, foreign_history)
+
+    assert backend.calls[1]["prompt_ids"] == session._codec.encode_full(foreign_history)
+    assert session.snapshot_state()["rollback_count"] == 0
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
+    assert list(chains_by_id) == [1, 2]
+    assert _decode_response_ids(chains_by_id[1].buffer.response_ids) == "LOCAL"
+    assert _decode_response_ids(chains_by_id[2].buffer.response_ids) == "CURRENT"
+    assert chains_by_id[2].buffer.response_mask == [1] * len("CURRENT")
 
 
 @pytest.mark.asyncio
@@ -412,6 +555,12 @@ async def test_later_assistant_rollback_removes_only_the_response_side_gp():
     assert chain.buffer.response_mask == (
         [1] * len("A1") + [0] * len("user:second\nuser:replacement\nassistant:") + [1] * len("FIXED")
     )
+    fixed_start = len(chain.buffer.response_ids) - len("FIXED")
+    assert chain.buffer.generation_spans == [
+        (0, len("A1")),
+        (fixed_start - len("user:replacement\nassistant:"),) * 2,
+        (fixed_start, len(chain.buffer.response_ids)),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1320,8 +1469,8 @@ async def test_multiple_chains_length_exhaustion_does_not_materialize_unsent_med
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_abort_clears_length_materialized_trajectories():
-    """Clear length-materialized trajectories when the session is aborted."""
+async def test_multiple_chains_abort_returns_snapshot_then_clears_session():
+    """Return a forensic snapshot while still clearing all live session state."""
     first_messages = [{"role": "user", "content": "first turn"}]
     session = _session(
         "abort-clears-materialized",
@@ -1341,14 +1490,44 @@ async def test_multiple_chains_abort_clears_length_materialized_trajectories():
     assert outcome.finish_reason == "length"
     assert session.snapshot_state()["num_trajectories"] == 1
 
-    await session.abort()
+    aborted_trajectories = await session.abort()
 
     state = session.snapshot_state()
+    assert len(aborted_trajectories) == 1
+    assert _decode_response_ids(aborted_trajectories[0].response_ids) == "FIRST"
+    assert aborted_trajectories[0].num_turns > 0
     assert state["phase"] == "ABORTED"
     assert state["num_trajectories"] == 0
     assert state["num_active_chains"] == 0
     with pytest.raises(RuntimeError, match="aborted"):
         await session.finalize()
+
+    assert await session.abort() == []
+
+
+@pytest.mark.asyncio
+async def test_abort_without_a_generation_returns_no_trajectory():
+    session = _session("abort-empty")
+
+    assert await session.abort() == []
+    assert session.snapshot_state()["phase"] == "ABORTED"
+
+
+@pytest.mark.asyncio
+async def test_abort_snapshot_failure_still_clears_session(monkeypatch):
+    session = _session("abort-snapshot-failure")
+    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
+
+    def fail_materialization():
+        raise ValueError("snapshot encoding failed")
+
+    monkeypatch.setattr(session, "_materialize_active_chains", fail_materialization)
+
+    assert await session.abort() == []
+    state = session.snapshot_state()
+    assert state["phase"] == "ABORTED"
+    assert state["num_active_chains"] == 0
+    assert state["num_trajectories"] == 0
 
 
 @pytest.mark.asyncio

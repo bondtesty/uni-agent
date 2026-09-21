@@ -27,6 +27,12 @@ from uni_agent.gateway.adapters.openai import (
     openai_stream_response,
     openai_to_internal,
 )
+from uni_agent.gateway.adapters.responses import (
+    responses_build_response,
+    responses_error_body,
+    responses_stream_response,
+    responses_to_internal,
+)
 from uni_agent.gateway.adapters.types import AnthropicRequest, MalformedRequestError, OpenAIChatCompletionRequest
 from uni_agent.gateway.config import GatewayActorConfig
 from uni_agent.gateway.session import (
@@ -95,6 +101,8 @@ class _GatewayActor:
         def _error_body_for_path(path: str, status_code: int, message: str) -> dict[str, Any]:
             if path.endswith("/v1/messages"):
                 return anthropic_error_body(status_code, message)
+            if path.endswith("/v1/responses"):
+                return responses_error_body(status_code, message)
             return openai_error_body(status_code, message)
 
         @self._app.exception_handler(HTTPException)
@@ -137,6 +145,14 @@ class _GatewayActor:
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
             return await self._handle_anthropic_messages(session_id=session_id, payload=payload)
+
+        @self._app.post("/sessions/{session_id}/v1/responses")
+        async def _openai_responses(session_id: str, request: Request):
+            try:
+                payload = await request.json()
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+            return await self._handle_openai_responses(session_id=session_id, payload=payload)
 
         @self._app.post("/sessions/{session_id}/reward_info")
         async def _reward_info(session_id: str, request: Request):
@@ -212,6 +228,36 @@ class _GatewayActor:
             return anthropic_stream_response(outcome, model=model)
         return JSONResponse(anthropic_build_response(outcome, model=model))
 
+    async def _handle_openai_responses(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+    ) -> JSONResponse | StreamingResponse:
+        """Validate a Responses payload and serialize the session outcome."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail=f"Unknown session_id: {session_id}")
+
+        try:
+            internal = responses_to_internal(
+                payload,
+                base_sampling_params=dict(session.sampling_params),
+                allowed_sampling_keys=self._allowed_request_sampling_param_keys,
+            )
+            _validate_sampling_params(internal["sampling_params"])
+        except MalformedRequestError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        model = str(payload.get("model") or "unknown")
+        if payload.get("stream") is True:
+            return responses_stream_response(
+                lambda: session.run_generation(internal, self._backend),
+                payload=payload,
+                model=model,
+            )
+        outcome = await session.run_generation(internal, self._backend)
+        return JSONResponse(responses_build_response(outcome, payload=payload, model=model))
+
     async def start(self) -> None:
         """Start the FastAPI server backing this gateway actor."""
         if self._server_task is not None:
@@ -271,13 +317,15 @@ class _GatewayActor:
         self._sessions.pop(session_id, None)
         return trajectories
 
-    async def abort_session(self, session_id: str) -> None:
-        """Abort a session and remove it from the actor if it still exists."""
+    async def abort_session(self, session_id: str) -> list[Trajectory]:
+        """Abort a session, returning an observation-only history snapshot."""
         session = self._sessions.get(session_id)
         if session is None:
-            return  # Already finalized or aborted — treat as idempotent.
-        await session.abort()
-        self._sessions.pop(session_id, None)
+            return []  # Already finalized or aborted — treat as idempotent.
+        try:
+            return await session.abort()
+        finally:
+            self._sessions.pop(session_id, None)
 
     async def get_session_state(self, session_id: str) -> dict[str, Any]:
         """Return a snapshot of a live session's state."""

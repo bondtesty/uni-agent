@@ -43,6 +43,28 @@ class _FakeGateway:
 
 
 @pytest.mark.asyncio
+async def test_gateway_manager_routes_session_state_to_owner():
+    from uni_agent.gateway.manager import GatewayManager
+
+    gateway = _FakeGateway()
+
+    async def _state(session_id):
+        return {"session_id": session_id, "in_flight_requests": 1}
+
+    gateway.get_session_state = _FakeRemoteMethod(_state)
+    manager = GatewayManager.__new__(GatewayManager)
+    manager.gateways = [gateway]
+    manager.gateway_count = 1
+    manager.active_sessions_per_gateway = [1]
+    manager._session_to_gateway_index = {"session-1": 0}
+
+    assert await manager.get_session_state("session-1") == {
+        "session_id": "session-1",
+        "in_flight_requests": 1,
+    }
+
+
+@pytest.mark.asyncio
 async def test_gateway_manager_balances_concurrent_session_creation():
     """Concurrently created sessions must spread evenly across gateways. The
     selection counter has to be reserved before the create await; otherwise a

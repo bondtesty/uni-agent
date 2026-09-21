@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -16,6 +17,7 @@ from uni_agent.gateway.session.codec import MessageCodec
 from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
+logger = logging.getLogger(__name__)
 
 
 class SessionPhase(str, Enum):
@@ -57,6 +59,7 @@ class TrajectoryBuffer:
     prompt_ids: list[int]
     response_ids: list[int] = field(default_factory=list)
     response_mask: list[int] = field(default_factory=list)
+    generation_spans: list[tuple[int, int]] = field(default_factory=list)
     response_logprobs: list[float] = field(default_factory=list)
     routed_experts: Any | None = None
     generation_versions: list[tuple[int | None, int | None]] = field(default_factory=list)
@@ -86,6 +89,8 @@ class ChainState:
     video_data: list[Any] | None
     last_assistant_start: LastAssistantStart
     updated_seq: int
+    pending_tool_call_ids: tuple[str, ...] = ()
+    awaiting_external_followup_since: float | None = None
 
 
 @dataclass
@@ -208,6 +213,7 @@ class GatewaySession:
         self.phase = SessionPhase.ACTIVE
         self.created_at = time.time()
         self.updated_at = self.created_at
+        self._in_flight_requests = 0
         self.request_lock = asyncio.Lock()
 
     @property
@@ -229,6 +235,7 @@ class GatewaySession:
         # completion order. The framework currently scores session_trajectories[-1]
         # and broadcasts that reward, so concurrent siblings share one reward target.
         reserved_chain_id: int | None = None
+        request_started = False
         try:
             async with self.request_lock:
                 if self.phase != SessionPhase.ACTIVE:
@@ -236,6 +243,8 @@ class GatewaySession:
                         status_code=409,
                         detail=f"Session {self.handle.session_id} is {self.phase.value.lower()}",
                     )
+                self._in_flight_requests += 1
+                request_started = True
                 # Prepare can touch codec and multimodal extractor state, so only
                 # backend generation runs outside the session lock.
                 encoded = await self._prepare_generation_inputs(request)
@@ -268,6 +277,7 @@ class GatewaySession:
                 raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}") from e
 
             response_ids = list(output.token_ids)
+            generation_start = len(encoded.buffer.response_ids)
             encoded.buffer.generation_versions.append(
                 (
                     output.extra_fields.get("min_global_steps"),
@@ -276,6 +286,7 @@ class GatewaySession:
             )
             encoded.buffer.response_ids.extend(response_ids)
             encoded.buffer.response_mask.extend([1] * len(response_ids))
+            encoded.buffer.generation_spans.append((generation_start, generation_start + len(response_ids)))
             if encoded.sampling_params.get("logprobs", False):
                 if output.log_probs is None:
                     raise RuntimeError("backend omitted logprobs when requested")
@@ -308,6 +319,7 @@ class GatewaySession:
                 assistant_msg, finish_reason = await self._codec.decode_response(
                     response_ids,
                     tools=encoded.tools,
+                    parser_tools=self._codec.parser_tools_for_messages(encoded.tools, encoded.messages),
                     stop_reason=output.stop_reason,
                 )
                 self._commit_generation_to_chain(encoded, assistant_msg)
@@ -324,6 +336,8 @@ class GatewaySession:
         finally:
             if reserved_chain_id is not None:
                 await asyncio.shield(self._release_chain_reservation(reserved_chain_id))
+            if request_started:
+                await asyncio.shield(self._finish_in_flight_request())
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
         """Store session-level reward metadata without closing the session."""
@@ -352,21 +366,52 @@ class GatewaySession:
             ]
             return [replace(trajectory, reward_info=dict(self.reward_info)) for trajectory in ordered_trajectories]
 
-    async def abort(self) -> None:
-        """Abort the session and prevent further generation."""
+    async def abort(self) -> list[Trajectory]:
+        """Abort the session and return an observation-only final snapshot.
+
+        The returned trajectories are intentionally not a replacement for
+        ``finalize()``: callers must not score or enqueue them.  They exist so
+        a framework timeout/transport failure can preserve the gateway history
+        before the live session is discarded.
+        """
         async with self.request_lock:
             if self.phase == SessionPhase.ABORTED:
-                return
+                return []
             if self.phase == SessionPhase.FINALIZED:
                 raise RuntimeError(f"Session {self.handle.session_id} is finalized")
-            self.phase = SessionPhase.ABORTED
-            self.active_chains = []
-            self.materialized_chains = []
-            self.reserved_chain_ids.clear()
-            self._touch()
+            trajectories: list[Trajectory] = []
+            try:
+                self._materialize_active_chains()
+                trajectories = [
+                    materialized.trajectory
+                    for materialized in sorted(self.materialized_chains, key=lambda chain: chain.order_seq)
+                ]
+                trajectories = [
+                    replace(trajectory, reward_info=dict(self.reward_info)) for trajectory in trajectories
+                ]
+            except Exception:
+                logger.exception("Session %s: failed to materialize abort snapshot", self.handle.session_id)
+            finally:
+                self.phase = SessionPhase.ABORTED
+                self.active_chains = []
+                self.materialized_chains = []
+                self.reserved_chain_ids.clear()
+                self._touch()
+            return trajectories
 
     def snapshot_state(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot for actor state inspection."""
+        awaiting_chains = [
+            chain
+            for chain in self.active_chains
+            if chain.pending_tool_call_ids and chain.awaiting_external_followup_since is not None
+        ]
+        awaiting_since = min(
+            (chain.awaiting_external_followup_since for chain in awaiting_chains),
+            default=None,
+        )
+        now = time.time()
+        idle_start = max(awaiting_since, self.updated_at) if awaiting_since is not None else None
         return {
             "session_id": self.handle.session_id,
             "phase": self.phase.value,
@@ -377,6 +422,20 @@ class GatewaySession:
             "num_active_chains": len(self.active_chains),
             "active_chain_ids": [chain.chain_id for chain in self.active_chains],
             "active_chain_tip_hashes": {chain.chain_id: chain.message_tip_hash for chain in self.active_chains},
+            "in_flight_requests": self._in_flight_requests,
+            "awaiting_external_followup": bool(awaiting_chains),
+            "awaiting_since": awaiting_since,
+            "awaiting_external_followup_seconds": (
+                max(0.0, now - idle_start) if idle_start is not None else None
+            ),
+            "session_idle_seconds": max(0.0, now - self.updated_at),
+            "agent_finished": bool(self.reward_info.get("agent_finished")),
+            "pending_tool_call_ids": sorted(
+                {tool_call_id for chain in awaiting_chains for tool_call_id in chain.pending_tool_call_ids}
+            ),
+            "pending_tool_calls_by_chain": {
+                str(chain.chain_id): list(chain.pending_tool_call_ids) for chain in awaiting_chains
+            },
             "rollback_count": self._rollback_count,
             "rollback_dropped_trainable_tokens_total": self._rollback_dropped_trainable_tokens_total,
         }
@@ -393,6 +452,15 @@ class GatewaySession:
             tools=tools,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
+        if selection is not None:
+            selected_chain, rollback_to_last_assistant = selection
+            suffix_start = (
+                selected_chain.last_assistant_start.message_history_len
+                if rollback_to_last_assistant
+                else len(selected_chain.message_history)
+            )
+            if not self._codec.supports_incremental(messages[suffix_start:]):
+                selection = None
         rollback_applied = False
         rollback_dropped_trainable_tokens = 0
 
@@ -432,6 +500,13 @@ class GatewaySession:
                 del buffer.response_ids[rollback_response_len:]
                 del buffer.response_mask[rollback_response_len:]
                 del buffer.response_logprobs[rollback_response_len:]
+                kept_spans = [
+                    (start, end)
+                    for start, end in buffer.generation_spans
+                    if end <= rollback_response_len
+                ]
+                dropped_span_count = len(buffer.generation_spans) - len(kept_spans)
+                buffer.generation_spans = kept_spans
 
                 assistant_prefix = self._codec.turn_separator + self._codec.generation_prompt
                 stored_ids = buffer.prompt_ids if rollback_response_len == 0 else buffer.response_ids
@@ -442,6 +517,10 @@ class GatewaySession:
                 if rollback_response_len:
                     del buffer.response_mask[assistant_prefix_start:]
                     del buffer.response_logprobs[assistant_prefix_start:]
+                tombstone_offset = len(buffer.response_ids)
+                buffer.generation_spans.extend(
+                    [(tombstone_offset, tombstone_offset)] * dropped_span_count
+                )
                 self._assert_response_logprob_alignment(buffer)
                 incremental_messages = messages[last_assistant_start.message_history_len :]
                 rollback_applied = True
@@ -627,6 +706,7 @@ class GatewaySession:
             prompt_ids=list(buffer.prompt_ids),
             response_ids=list(buffer.response_ids),
             response_mask=list(buffer.response_mask),
+            generation_spans=list(buffer.generation_spans),
             response_logprobs=list(buffer.response_logprobs),
             routed_experts=buffer.routed_experts,
             generation_versions=list(buffer.generation_versions),
@@ -681,6 +761,8 @@ class GatewaySession:
         if encoded.last_assistant_start is None:
             raise RuntimeError("last assistant start is missing")
         self._record_rollback_stats(encoded)
+        new_pending_tool_call_ids = self._assistant_tool_call_ids(assistant_msg)
+        awaiting_since = time.time() if new_pending_tool_call_ids else None
         if encoded.chain_id is None:
             order_seq = self._next_order_seq()
             chain_id = self._allocate_chain_id()
@@ -695,6 +777,8 @@ class GatewaySession:
                     video_data=self._copy_media_list(encoded.video_data),
                     last_assistant_start=encoded.last_assistant_start,
                     updated_seq=order_seq,
+                    pending_tool_call_ids=new_pending_tool_call_ids,
+                    awaiting_external_followup_since=awaiting_since,
                 )
             )
             return
@@ -711,6 +795,18 @@ class GatewaySession:
             video_data=self._copy_media_list(encoded.video_data),
             last_assistant_start=encoded.last_assistant_start,
             updated_seq=order_seq,
+            pending_tool_call_ids=new_pending_tool_call_ids,
+            awaiting_external_followup_since=awaiting_since,
+        )
+
+    def _assistant_tool_call_ids(self, assistant_msg: dict[str, Any]) -> tuple[str, ...]:
+        tool_calls = assistant_msg.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return ()
+        return tuple(
+            str(tool_call["id"])
+            for tool_call in tool_calls
+            if isinstance(tool_call, dict) and tool_call.get("id")
         )
 
     def _close_length_exhausted_chain(self, encoded: EncodedData) -> None:
@@ -761,6 +857,13 @@ class GatewaySession:
         async with self.request_lock:
             self.reserved_chain_ids.discard(chain_id)
 
+    async def _finish_in_flight_request(self) -> None:
+        async with self.request_lock:
+            self._in_flight_requests -= 1
+            if self._in_flight_requests < 0:
+                raise RuntimeError("in-flight request count became negative")
+            self._touch()
+
     def _next_order_seq(self) -> int:
         self._order_seq += 1
         return self._order_seq
@@ -799,6 +902,7 @@ class GatewaySession:
             prompt_ids=list(chain.buffer.prompt_ids),
             response_ids=list(chain.buffer.response_ids),
             response_mask=list(chain.buffer.response_mask),
+            generation_spans=list(chain.buffer.generation_spans),
             response_logprobs=response_logprobs,
             reward_info={},
             num_turns=self._count_chat_turns(chain.message_history),
@@ -808,6 +912,13 @@ class GatewaySession:
                 chain.video_data,
             ),
             extra_fields=trajectory_extra_fields,
+            messages=list(chain.message_history),
+            model_messages=self._codec.model_messages_for(
+                chain.message_history,
+                chain.active_tool_schemas,
+            ),
+            tools=list(chain.active_tool_schemas) if chain.active_tool_schemas is not None else None,
+            model_tools=self._codec.model_tools_for(chain.active_tool_schemas),
         )
 
     def _count_chat_turns(self, message_history: list[dict[str, Any]]) -> int:

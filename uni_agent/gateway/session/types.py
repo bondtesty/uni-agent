@@ -51,6 +51,9 @@ class Trajectory:
             tokens added during continuation turns.
         response_mask: Per-token labels for ``response_ids``; ``1`` marks model
             output and ``0`` marks interstitial context tokens.
+        generation_spans: ``(start, end)`` offsets for each model generation in
+            ``response_ids``. Spans are ordered by generation and exclude
+            interstitial context tokens.
         response_logprobs: Optional log probabilities aligned with
             ``response_ids``; continuation context tokens use ``0.0``.
         reward_info: Reward metadata attached through the session reward-info
@@ -59,6 +62,12 @@ class Trajectory:
         num_turns: Chat-turn count materialized with the trajectory.
         routed_experts: Optional expert-routing data captured by the backend.
         multi_modal_data: Optional image/video data associated with the prompt.
+        messages: Normalized session transcript, including tool calls and results.
+        model_messages: Messages as exposed to the model-facing chat/template layer.
+        tools: Tool schemas active in the session transcript/codec.
+        model_tools: Tool schemas exposed to the model-facing layer.  The current
+            gateway has no separate transformation, so this equals ``tools``;
+            keeping both fields makes that boundary explicit for future adapters.
         extra_fields: Gateway-owned extension fields, such as trajectory
             materialization metadata consumed by training adapters and the
             ``min_global_steps``/``max_global_steps`` weight-version span.
@@ -67,6 +76,7 @@ class Trajectory:
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
+    generation_spans: list[tuple[int, int]] = field(default_factory=list)
     response_logprobs: list[float] | None = None
     reward_info: dict[str, Any] = field(default_factory=dict)
     reward_score: float | None = None
@@ -74,3 +84,7 @@ class Trajectory:
     routed_experts: torch.Tensor | np.ndarray | None = None
     multi_modal_data: dict[str, Any] | None = None
     extra_fields: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, Any]] | None = None
+    model_messages: list[dict[str, Any]] | None = None
+    tools: list[dict[str, Any]] | None = None
+    model_tools: list[dict[str, Any]] | None = None

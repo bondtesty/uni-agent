@@ -72,6 +72,7 @@ def build_agent_framework(
     return framework_cls.from_config(
         config=config,
         gateway_manager=gateway_manager,
+        tokenizer=model_config.tokenizer,
         processor=model_config.processor,
         reward_loop_worker_handles=reward_loop_worker_handles,
     )

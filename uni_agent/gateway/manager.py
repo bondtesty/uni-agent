@@ -12,6 +12,7 @@ import asyncio
 import ray
 
 from uni_agent.gateway.config import GatewayActorConfig
+from uni_agent.gateway.session import Trajectory
 from verl.workers.rollout.llm_server import LLMServerClient
 
 
@@ -39,7 +40,9 @@ class GatewayManager:
         # Round-robin across alive CPU nodes so gateway actors do not all pack onto
         # the driver node under Ray's default PACK scheduling. Mirrors
         # AgentLoopWorker placement (verl/experimental/agent_loop/agent_loop.py).
-        node_ids = [node["NodeID"] for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        alive = [node for node in ray.nodes() if node["Alive"] and node["Resources"].get("CPU", 0) > 0]
+        gpu_nodes = [node for node in alive if node["Resources"].get("GPU", 0) > 0]
+        node_ids = [node["NodeID"] for node in (gpu_nodes or alive)]
         if not node_ids:
             raise RuntimeError("No alive CPU nodes available for GatewayActor placement")
 
@@ -99,12 +102,19 @@ class GatewayManager:
         self.active_sessions_per_gateway[gateway_index] -= 1
         return trajectories
 
-    async def abort_session(self, session_id: str) -> None:
-        """Abort a routed session on its owning actor and release the route."""
+    async def abort_session(self, session_id: str) -> list[Trajectory]:
+        """Abort a routed session and return its observation-only snapshot."""
         gateway, gateway_index = self._get_gateway(session_id)
-        await gateway.abort_session.remote(session_id=session_id)
-        self._session_to_gateway_index.pop(session_id, None)
-        self.active_sessions_per_gateway[gateway_index] -= 1
+        try:
+            return await gateway.abort_session.remote(session_id=session_id)
+        finally:
+            self._session_to_gateway_index.pop(session_id, None)
+            self.active_sessions_per_gateway[gateway_index] -= 1
+
+    async def get_session_state(self, session_id: str) -> dict[str, object]:
+        """Return structured activity state from the actor that owns a session."""
+        gateway, _ = self._get_gateway(session_id)
+        return await gateway.get_session_state.remote(session_id=session_id)
 
     async def shutdown(self) -> None:
         """Stop owned gateway actors and clear routing state."""

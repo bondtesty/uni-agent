@@ -483,7 +483,7 @@ async def test_unsupported_capabilities_rejected_with_400():
 
 @pytest.mark.asyncio
 async def test_provider_stream_true_returns_sse():
-    """OpenAI and Anthropic requests with stream=true return provider-shaped
+    """OpenAI, Responses, and Anthropic requests return provider-shaped
     StreamingResponse bodies."""
     from fastapi.responses import StreamingResponse
 
@@ -501,6 +501,21 @@ async def test_provider_stream_true_returns_sse():
         openai_text = (b"".join([chunk async for chunk in openai_resp.body_iterator])).decode()
         assert "chat.completion.chunk" in openai_text
         assert "data: [DONE]" in openai_text
+
+        await actor.create_session("s-responses-stream")
+        responses_resp = await actor._handle_openai_responses(
+            "s-responses-stream",
+            {
+                "model": "policy",
+                "input": "hi",
+                "stream": True,
+                "tools": [{"type": "custom", "name": "exec", "description": "Run a command"}],
+            },
+        )
+        assert isinstance(responses_resp, StreamingResponse)
+        responses_text = (b"".join([chunk async for chunk in responses_resp.body_iterator])).decode()
+        assert "event: response.created" in responses_text
+        assert "event: response.completed" in responses_text
 
         await actor.create_session("s-an-stream")
         anthropic_resp = await actor._handle_anthropic_messages(
@@ -1447,6 +1462,44 @@ async def test_gateway_actor_tool_call_decode_returns_openai_format(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_anthropic_progressed_branch_starts_sibling_chain():
+    """A progressed client history must not splice into a shorter chain."""
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    backend = SequencedBackend(["LOCAL", "CURRENT"])
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
+    await actor.start()
+    try:
+        await actor.create_session("s-progressed")
+        await actor._handle_anthropic_messages(
+            "s-progressed",
+            {"max_tokens": 16, "messages": [{"role": "user", "content": "run task"}]},
+        )
+        response = await actor._handle_anthropic_messages(
+            "s-progressed",
+            {
+                "max_tokens": 16,
+                "messages": [
+                    {"role": "user", "content": "run task"},
+                    {"role": "assistant", "content": "LOCAL"},
+                    {"role": "user", "content": "first tool result"},
+                    {"role": "assistant", "content": "FOREIGN-LATER"},
+                    {"role": "user", "content": "second tool result"},
+                ],
+            },
+        )
+
+        assert json.loads(response.body)["content"][0]["text"] == "CURRENT"
+        assert (await actor.get_session_state("s-progressed"))["active_chain_ids"] == [1, 2]
+        trajectories = await actor.finalize_session("s-progressed")
+        assert len(trajectories) == 2
+        assert all(trajectory.response_mask == [1] * len(trajectory.response_ids) for trajectory in trajectories)
+    finally:
+        await actor.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_anthropic_messages_end_to_end():
     """The Anthropic Messages route lowers a simple request, runs one
     generation, and serializes an Anthropic message response."""
@@ -1599,6 +1652,7 @@ async def test_provider_malformed_json_uses_error_envelope():
     try:
         await actor.create_session("s-json-anth")
         await actor.create_session("s-json-openai")
+        await actor.create_session("s-json-responses")
         transport = httpx.ASGITransport(app=actor._app)
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
             anthropic = await client.post(
@@ -1608,6 +1662,11 @@ async def test_provider_malformed_json_uses_error_envelope():
             )
             openai = await client.post(
                 "/sessions/s-json-openai/v1/chat/completions",
+                content="{bad",
+                headers={"content-type": "application/json"},
+            )
+            responses = await client.post(
+                "/sessions/s-json-responses/v1/responses",
                 content="{bad",
                 headers={"content-type": "application/json"},
             )
@@ -1621,6 +1680,8 @@ async def test_provider_malformed_json_uses_error_envelope():
         openai_body = openai.json()
         assert openai_body["error"]["type"] == "invalid_request_error"
         assert "message" in openai_body["error"]
+        assert responses.status_code == 400
+        assert responses.json()["error"]["type"] == "invalid_request_error"
     finally:
         await actor.shutdown()
 

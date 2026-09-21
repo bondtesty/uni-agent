@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import numpy as np
@@ -8,7 +9,11 @@ import pytest
 import torch
 
 from tests.uni_agent.support import logging_runner
-from uni_agent.framework.framework import OpenAICompatibleAgentFramework, _align_routed_experts
+from uni_agent.framework.framework import (
+    OpenAICompatibleAgentFramework,
+    _align_routed_experts,
+    _normalize_repetition_detect_config,
+)
 from uni_agent.gateway.session import SessionHandle, Trajectory
 from verl.utils import tensordict_utils as tu
 
@@ -75,6 +80,35 @@ def _inline_runner_config(
     return config
 
 
+def test_semantic_trajectory_dump_preserves_model_and_session_tools(tmp_path):
+    """Semantic dumps retain the transcript/tool boundary used by replay tools."""
+    framework = object.__new__(OpenAICompatibleAgentFramework)
+    trajectory = Trajectory(
+        prompt_ids=[1],
+        response_ids=[2],
+        response_mask=[1],
+        num_turns=2,
+        messages=[
+            {"role": "user", "content": "inspect", "tool_calls": []},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"function": {"name": "read", "arguments": "{}"}}
+            ]},
+        ],
+        model_messages=[{"role": "user", "content": "inspect"}],
+        tools=[{"type": "function", "function": {"name": "read"}}],
+        model_tools=[{"type": "function", "function": {"name": "read", "parameters": {}}}],
+    )
+
+    framework._dump_semantic_trajectory(tmp_path, "session-1", [trajectory])
+    payload = json.loads((tmp_path / "traj.json").read_text())
+
+    assert payload["trajectory_format"] == "mimoagent"
+    assert payload["trajs"]["main"]["messages"] == trajectory.messages
+    assert payload["trajs"]["main"]["model_messages"] == trajectory.model_messages
+    assert payload["trajs"]["main"]["tools"] == trajectory.tools
+    assert payload["trajs"]["main"]["model_tools"] == trajectory.model_tools
+
+
 async def _build_framework_with_agent_runners(
     *,
     agent_runners: dict[str, dict[str, object]],
@@ -84,6 +118,7 @@ async def _build_framework_with_agent_runners(
     val_n: int = 1,
     log_dir: str | None = None,
     mask_unfinished_episode: bool = False,
+    tokenizer=None,
 ):
     from omegaconf import OmegaConf
 
@@ -117,8 +152,32 @@ async def _build_framework_with_agent_runners(
     return OpenAICompatibleAgentFramework.from_config(
         config=config,
         gateway_manager=gateway_manager,
+        tokenizer=tokenizer,
         reward_loop_worker_handles=reward_loop_worker_handles,
     )
+
+
+def test_session_sampling_params_include_tokenizer_eos():
+    """Unified sessions explicitly stop on the tokenizer's turn terminator."""
+    from types import SimpleNamespace
+
+    class _Tokenizer:
+        eos_token_id = 248046
+
+    config = SimpleNamespace(
+        temperature=1.0,
+        top_p=0.95,
+        top_k=20,
+        calculate_log_probs=False,
+        val_kwargs=SimpleNamespace(temperature=1.0, top_p=0.95, top_k=20),
+    )
+    framework = object.__new__(OpenAICompatibleAgentFramework)
+    framework._rollout_config = config
+    framework._tokenizer = _Tokenizer()
+
+    params = framework._build_session_sampling_params(partition_id="val", sample_fields={})
+
+    assert params["stop_token_ids"] == [248046]
 
 
 @pytest.mark.parametrize(
@@ -237,8 +296,13 @@ class _FakeGatewayManager:
     """Fake runtime that matches session IDs by prefix (``session-sample-{sample}-rollout-{rollout}``)
     to support the real uuid-suffixed IDs produced by the framework."""
 
-    def __init__(self, finalized_by_session_prefix: dict[str, list[Trajectory]]):
+    def __init__(
+        self,
+        finalized_by_session_prefix: dict[str, list[Trajectory]],
+        aborted_by_session_prefix: dict[str, list[Trajectory]] | None = None,
+    ):
         self._finalized_by_prefix = finalized_by_session_prefix
+        self._aborted_by_prefix = aborted_by_session_prefix or {}
         self.created_sessions = []
         self.created_session_kwargs = []
         self.finalized_sessions = []
@@ -263,8 +327,12 @@ class _FakeGatewayManager:
         self.finalized_sessions.append(session_id)
         return self._lookup(session_id)
 
-    async def abort_session(self, session_id: str) -> None:
+    async def abort_session(self, session_id: str) -> list[Trajectory]:
         self.aborted_sessions.append(session_id)
+        for prefix, trajectories in self._aborted_by_prefix.items():
+            if session_id.startswith(prefix):
+                return trajectories
+        return []
 
 
 def _build_prompts(
@@ -656,6 +724,148 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
 
 
 @pytest.mark.asyncio
+async def test_repetition_guard_zeroes_reward_and_writes_repetition_mask(monkeypatch, fake_tq):
+    """End to end: a looping generation span is masked in TQ and zeroes the reward.
+
+    The runner posted ``reward=1`` (the verifier graded the pre-loop patch, exactly the
+    soyus failure mode); with ``repetition_detect`` on, the framework overrides the
+    scalar to 0 before ``rm_scores`` is built, ships ``repetition_mask`` covering the
+    hit span only, and tags the row so the trainer can report hit rates per harness.
+    """
+    loop = [7, 7, 7] * 20
+    clean = list(range(100, 130))
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                Trajectory(
+                    prompt_ids=[10, 11],
+                    response_ids=clean + loop,
+                    response_mask=[1] * 90,
+                    generation_spans=[(0, 30), (30, 90)],
+                    reward_info={"reward": 1.0, "agent_type": "cc-agent"},
+                    num_turns=2,
+                )
+            ],
+        }
+    )
+    _install_fake_score(monkeypatch)
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        reward_loop_worker_handles=["sentinel"],
+    )
+    framework._repetition_detect = _normalize_repetition_detect_config(
+        {"enable": True, "ngram_size": 3, "window_size": 30, "min_content_length": 0, "min_repeat": 4, "zero_reward": True}
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
+
+    put = fake_tq.batch_puts[0]
+    fields, tag = put["fields"], put["tags"][0]
+    assert fields["rm_scores"][0].tolist() == [0.0] * 90
+    assert fields["repetition_mask"][0].tolist() == [0.0] * 30 + [1.0] * 60
+    assert fields["response_mask"][0].tolist() == [1] * 90  # masking is the trainer's decision
+    assert (tag["repetition_hit"], tag["repetition_zeroed_reward"]) == (1, 1)
+    assert (tag["repetition_alignment"], tag["repetition_segment_count"]) == ("ok", 1)
+    assert tag["agent_type"] == "cc-agent"
+
+
+@pytest.mark.asyncio
+async def test_repetition_guard_disabled_leaves_rows_untouched(monkeypatch, fake_tq):
+    loop = [7, 7, 7] * 20
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [
+                Trajectory(
+                    prompt_ids=[10, 11],
+                    response_ids=loop,
+                    response_mask=[1] * 60,
+                    generation_spans=[(0, 60)],
+                    reward_info={"reward": 1.0},
+                    num_turns=1,
+                )
+            ],
+        }
+    )
+    _install_fake_score(monkeypatch)
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        reward_loop_worker_handles=["sentinel"],
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
+
+    put = fake_tq.batch_puts[0]
+    assert put["fields"]["rm_scores"][0].tolist()[-1] == 1.0
+    assert not put["fields"]["repetition_mask"][0].any()
+    assert put["tags"][0]["repetition_alignment"] == "not_detected"
+    assert put["tags"][0]["repetition_hit"] == 0
+
+
+@pytest.mark.asyncio
+async def test_tq_tag_carries_agent_type_for_per_harness_metrics(monkeypatch, fake_tq):
+    """Mixed-harness metrics read ``agent_type`` from the TQ tag, not a field.
+
+    ``_trajectory_to_tq_field_and_tag`` spreads the Gateway's ``extra_fields`` into
+    individual columns, so there is no ``extra_fields`` column for the trainer to
+    select. The tag is the delivery channel, and it must be populated on every row so
+    the trainer can group rewards per harness.
+    """
+    runtime = _FakeGatewayManager(
+        {
+            "session-sample-0-rollout-0": [_trajectory(reward_info={
+                "agent_type": "codex", "tag_data_source_with_harness": True,
+                "tool_call_error_count": 2,
+                "tool_call_error_invalid_arguments_count": 2,
+            })],
+            "session-sample-0-rollout-1": [_trajectory(reward_info={
+                "selected_harness": "claude-code", "tag_data_source_with_harness": True,
+            })],
+        }
+    )
+    _install_fake_score(monkeypatch)
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        reward_loop_worker_handles=["sentinel"],
+        n=2,
+        val_n=2,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
+
+    assert fake_tq.batch_puts[0]["tags"][0]["agent_type"] == "codex"
+    assert fake_tq.batch_puts[0]["tags"][0]["tool_call_error_count"] == 2
+    assert fake_tq.batch_puts[0]["tags"][0]["tool_call_error_invalid_arguments_count"] == 2
+    assert fake_tq.batch_puts[1]["tags"][0]["agent_type"] == "claude-code"
+    assert tu.get(fake_tq.batch_puts[0]["fields"], "data_source") == ["deepeyes@codex"]
+    assert tu.get(fake_tq.batch_puts[1]["fields"], "data_source") == ["deepeyes@claude-code"]
+    assert "agent_type" not in fake_tq.batch_puts[0]["fields"].keys()
+
+
+@pytest.mark.asyncio
+async def test_tq_tag_agent_type_falls_back_to_unknown(monkeypatch, fake_tq):
+    """A harness that reports no identity still yields a groupable tag value."""
+    runtime = _FakeGatewayManager({"session-sample-0-rollout-0": [_trajectory()]})
+    _install_fake_score(monkeypatch)
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=runtime,
+        reward_loop_worker_handles=["sentinel"],
+        n=1,
+        val_n=1,
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=7))
+
+    assert fake_tq.batch_puts[0]["tags"][0]["agent_type"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_generate_sequences_masks_unfinished_trajectory_without_dropping_it(fake_tq):
     runtime = _FakeGatewayManager(
         {
@@ -900,6 +1110,85 @@ async def test_generate_sequences_keeps_successful_sessions_when_one_session_fai
     assert fake_tq.puts == [{"key": "uid-0", "partition_id": "train", "tag": {"status": "finished"}}]
     assert len(runtime.aborted_sessions) == 1
     assert runtime.aborted_sessions[0].startswith("session-sample-0-rollout-1-")
+
+
+@pytest.mark.asyncio
+async def test_failed_session_snapshot_is_observation_only(tmp_path, fake_tq):
+    """A failed session is dumped, but its snapshot never enters TransferQueue."""
+    runtime = _FakeGatewayManager(
+        {"session-sample-0-rollout-0": [_trajectory()]},
+        {"session-sample-0-rollout-1": [_trajectory(num_turns=7, response_ids=[20, 21, 22])]},
+    )
+
+    async def agent_runner(*, raw_prompt, session, sample_index, tools_kwargs, **kwargs):
+        if session.session_id.startswith("session-sample-0-rollout-1-"):
+            raise TimeoutError("framework deadline")
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(agent_runner)},
+        gateway_manager=runtime,
+        n=2,
+        val_n=2,
+        log_dir=str(tmp_path),
+    )
+
+    await framework.generate_sequences(_build_prompts(count=1, global_steps=8))
+
+    assert fake_tq.batch_puts[0]["keys"] == ["uid-0_0_0"]
+    failed_dirs = [path for path in (tmp_path / "step_8").iterdir() if path.is_dir() and "rollout-1" in path.name]
+    assert len(failed_dirs) == 1
+    failed_dir = failed_dirs[0]
+    manifest = json.loads((failed_dir / "session.json").read_text())
+    assert manifest["status"] == "timeout"
+    assert manifest["termination_kind"] == "framework_timeout"
+    assert manifest["num_turns"] == 7
+    assert manifest["has_trajectory"] is True
+    assert (failed_dir / "traj.json").exists()
+    assert (failed_dir / "trajectory.json").exists()
+    assert (failed_dir / "trajectory.npz").exists()
+
+
+@pytest.mark.asyncio
+async def test_abort_snapshot_error_does_not_replace_runner_error(tmp_path, fake_tq):
+    class AbortFailingGatewayManager(_FakeGatewayManager):
+        async def abort_session(self, session_id: str) -> list[Trajectory]:
+            self.aborted_sessions.append(session_id)
+            raise OSError("snapshot storage unavailable")
+
+    runtime = AbortFailingGatewayManager({})
+
+    async def agent_runner(**kwargs):
+        raise RuntimeError("original runner failure")
+
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(agent_runner)},
+        gateway_manager=runtime,
+        log_dir=str(tmp_path),
+    )
+    sample_fields = {
+        "raw_prompt": [{"role": "user", "content": "sample"}],
+        "tools_kwargs": {"dataset_index": 3},
+        "data_source": "swebench",
+    }
+
+    with pytest.raises(RuntimeError, match="original runner failure"):
+        await framework._run_session(
+            sample_fields=sample_fields,
+            sample_index=0,
+            session_index=0,
+            global_steps=4,
+            runner_name="runner",
+            runner_config=framework.runner_registry["runner"],
+            sampling_params={},
+        )
+
+    assert runtime.aborted_sessions
+    manifest_dirs = list((tmp_path / "step_4").glob("session-*/session.json"))
+    assert len(manifest_dirs) == 1
+    manifest = json.loads(manifest_dirs[0].read_text())
+    assert manifest["error_message"] == "original runner failure"
+    assert manifest["has_trajectory"] is False
+    assert fake_tq.batch_puts == []
 
 
 @pytest.mark.asyncio
